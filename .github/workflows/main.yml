@@ -1,0 +1,140 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      extra_disks:
+        description: "Extra virtual disks to create (además del disco del sistema)"
+        required: false
+        default: "4"
+        type: choice
+        options: ["2", "4", "6", "8"]
+      disk_size_gb:
+        description: "Tamaño de cada disco virtual (GB)"
+        required: false
+        default: "50"
+      gpu_virtual:
+        description: "Instalar GPU virtual (Parsec VDD)"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  secure-rdp:
+    name: "🖥️ RDP Session"
+    runs-on: windows-latest
+    timeout-minutes: 9999
+
+    steps:
+      - name: "📋 Información del sistema"
+        run: |
+          Write-Host ""
+          Write-Host "══════════════════════════════════════════" -ForegroundColor Cyan
+          Write-Host "   SISTEMA BASE - GitHub Actions Runner   " -ForegroundColor Cyan
+          Write-Host "══════════════════════════════════════════" -ForegroundColor Cyan
+          $cpu    = Get-WmiObject Win32_Processor | Select-Object -First 1
+          $mem    = Get-WmiObject Win32_ComputerSystem
+          $os     = Get-WmiObject Win32_OperatingSystem
+          Write-Host "  OS      : $($os.Caption) $($os.Version)" -ForegroundColor White
+          Write-Host "  CPU     : $($cpu.Name)" -ForegroundColor White
+          Write-Host "  Cores   : $($cpu.NumberOfCores) / Threads: $($cpu.NumberOfLogicalProcessors)" -ForegroundColor White
+          Write-Host "  RAM     : $([math]::Round($mem.TotalPhysicalMemory/1GB,2)) GB" -ForegroundColor White
+          Write-Host ""
+          Write-Host "  Discos detectados:" -ForegroundColor Yellow
+          Get-Disk | Format-Table Number, FriendlyName,
+            @{N='Size (GB)';E={[math]::Round($_.Size/1GB,1)}},
+            PartitionStyle, OperationalStatus -AutoSize
+          Write-Host "══════════════════════════════════════════" -ForegroundColor Cyan
+
+      - name: "💾 Crear y montar discos virtuales"
+        run: |
+          $diskCount  = [int]"${{ github.event.inputs.extra_disks }}"
+          $diskSizeGB = [int]"${{ github.event.inputs.disk_size_gb }}"
+          $vhdDir     = "C:\VirtualDisks"
+
+          Write-Host ""
+          Write-Host "══════════════════════════════════════════" -ForegroundColor Cyan
+          Write-Host "   CREANDO $diskCount DISCOS VIRTUALES    " -ForegroundColor Cyan
+          Write-Host "   Tamaño por disco: ${diskSizeGB} GB      " -ForegroundColor Cyan
+          Write-Host "══════════════════════════════════════════" -ForegroundColor Cyan
+
+          New-Item -ItemType Directory -Path $vhdDir -Force | Out-Null
+
+          for ($i = 1; $i -le $diskCount; $i++) {
+              $vhdPath = "$vhdDir\VirtualDisk$i.vhd"
+              $label   = "VDisk$i"
+
+              Write-Host ""
+              Write-Host "  [Disco $i/$diskCount] Iniciando..." -ForegroundColor Yellow
+
+              Write-Host "    ► Creando archivo VHD ($diskSizeGB GB)..." -ForegroundColor Gray
+              New-VHD -Path $vhdPath -SizeBytes ([int64]$diskSizeGB * 1GB) -Dynamic -ErrorAction Stop | Out-Null
+
+              Write-Host "    ► Montando en el sistema..." -ForegroundColor Gray
+              Mount-VHD -Path $vhdPath -ErrorAction Stop
+
+              $rawDisk = Get-Disk | Where-Object { $_.PartitionStyle -eq 'RAW' } | Select-Object -First 1
+              if (-not $rawDisk) {
+                  Write-Warning "    ⚠ No se encontró disco RAW, reintentando..."
+                  Start-Sleep -Seconds 3
+                  $rawDisk = Get-Disk | Where-Object { $_.PartitionStyle -eq 'RAW' } | Select-Object -First 1
+              }
+
+              Write-Host "    ► Inicializando (GPT)..." -ForegroundColor Gray
+              $rawDisk | Initialize-Disk -PartitionStyle GPT -PassThru | Out-Null
+
+              Write-Host "    ► Particionando y formateando NTFS..." -ForegroundColor Gray
+              $part = $rawDisk | New-Partition -AssignDriveLetter -UseMaximumSize
+              $part | Format-Volume -FileSystem NTFS `
+                                    -NewFileSystemLabel $label `
+                                    -Confirm:$false `
+                                    -Force | Out-Null
+
+              $letter = $part.DriveLetter
+              Write-Host "  ✅ Disco $i listo: ${letter}:\ [$label, ${diskSizeGB}GB NTFS]" -ForegroundColor Green
+          }
+
+          Write-Host ""
+          Write-Host "  Resumen de discos disponibles:" -ForegroundColor Cyan
+          Get-PSDrive -PSProvider FileSystem |
+            Where-Object { $_.Used -ne $null } |
+            Format-Table Name,
+              @{N='Used (GB)';E={[math]::Round($_.Used/1GB,2)}},
+              @{N='Free (GB)';E={[math]::Round($_.Free/1GB,2)}} -AutoSize
+          Write-Host "══════════════════════════════════════════" -ForegroundColor Cyan
+
+      - name: "🎮 Instalar GPU virtual (Parsec VDD)"
+        if: ${{ github.event.inputs.gpu_virtual == 'true' }}
+        run: |
+          Write-Host ""
+          Write-Host "══════════════════════════════════════════" -ForegroundColor Magenta
+          Write-Host "   INSTALANDO GPU VIRTUAL (Parsec VDD)   " -ForegroundColor Magenta
+          Write-Host "══════════════════════════════════════════" -ForegroundColor Magenta
+
+          $vddUrl  = "https://github.com/nomi-san/parsec-vdd/releases/download/v0.45.0/parsec-vdd-0.45.0.exe"
+          $vddPath = "$env:TEMP\parsec-vdd.exe"
+
+          Write-Host "  ► Descargando Parsec VDD..." -ForegroundColor Gray
+          try {
+              Invoke-WebRequest -Uri $vddUrl -OutFile $vddPath -UseBasicParsing -ErrorAction Stop
+              Write-Host "    Descarga completa." -ForegroundColor Gray
+          } catch {
+              Write-Warning "  ⚠ No se pudo descargar Parsec VDD: $_"
+              Write-Host "  Continuando sin GPU virtual..." -ForegroundColor Yellow
+              exit 0
+          }
+
+          Write-Host "  ► Instalando driver silenciosamente..." -ForegroundColor Gray
+          $proc = Start-Process -FilePath $vddPath -ArgumentList "/install", "/quiet" `
+                                -Wait -PassThru -ErrorAction SilentlyContinue
+          Remove-Item $vddPath -Force -ErrorAction SilentlyContinue
+
+          Start-Sleep -Seconds 8
+
+          $vddAdapter = Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
+                        Where-Object { $_.FriendlyName -match "Parsec|Virtual Display" }
+
+          if ($vddAdapter) {
+              Write-Host "  ✅ GPU virtual instalada: $($vddAdapter.FriendlyName)" -ForegroundColor Green
+          } else {
+              Write-Host "  ℹ Driver inst
